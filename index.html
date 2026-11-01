@@ -300,14 +300,83 @@ input[type=text]::placeholder{ color:var(--text-dim); }
     });
     return Object.assign({id:id}, data);
   }
+  // ---- authentication (Firebase Auth via REST, e-mail + mot de passe) ----
+  // The Web API key is public by design (it only identifies the project);
+  // access is enforced by the Firestore security rules, which only accept
+  // the owner's authenticated account.
+  var FIREBASE_API_KEY = 'AIzaSyCoWwlHvCO6ytB7QQIP8avf_pb6ssvGIuk';
+  var LS_AUTH_KEY = 'suivi_forme_auth_v1';
+  var authState = null;
+  function loadAuth(){
+    try{ var raw = localStorage.getItem(LS_AUTH_KEY); authState = raw ? JSON.parse(raw) : null; }catch(e){ authState = null; }
+  }
+  function saveAuth(){
+    try{
+      if(authState) localStorage.setItem(LS_AUTH_KEY, JSON.stringify(authState));
+      else localStorage.removeItem(LS_AUTH_KEY);
+    }catch(e){}
+  }
+  function authError(code, msg){ var e = new Error(msg||code); e.code = code; return e; }
+  async function authSignIn(email, password){
+    var res = await fetch('https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key='+FIREBASE_API_KEY, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({email:email, password:password, returnSecureToken:true})
+    });
+    var json = await res.json().catch(function(){ return {}; });
+    if(!res.ok){
+      var m = (json.error && json.error.message) || ('HTTP '+res.status);
+      throw authError('AUTH_FAILED', m);
+    }
+    authState = {idToken:json.idToken, refreshToken:json.refreshToken, expiresAt: Date.now() + (parseInt(json.expiresIn,10)||3600)*1000};
+    saveAuth();
+  }
+  async function authRefresh(){
+    var res = await fetch('https://securetoken.googleapis.com/v1/token?key='+FIREBASE_API_KEY, {
+      method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'},
+      body: 'grant_type=refresh_token&refresh_token='+encodeURIComponent(authState.refreshToken)
+    });
+    var json = await res.json().catch(function(){ return {}; });
+    if(!res.ok){
+      // 400 = refresh token refused (revoked / password changed): login again.
+      if(res.status>=400 && res.status<500){ authState = null; saveAuth(); showLogin(); throw authError('NO_AUTH','Session expirée'); }
+      throw new Error('refresh HTTP '+res.status);
+    }
+    authState = {idToken:json.id_token, refreshToken:json.refresh_token, expiresAt: Date.now() + (parseInt(json.expires_in,10)||3600)*1000};
+    saveAuth();
+  }
+  async function authToken(){
+    if(!authState){ showLogin(); throw authError('NO_AUTH','Connexion requise'); }
+    if(authState.expiresAt - Date.now() < 120000){
+      try{ await authRefresh(); }
+      catch(e){
+        if(e.code==='NO_AUTH') throw e;
+        // network failure: keep using the old token only while still valid
+        if(authState.expiresAt <= Date.now()) throw e;
+      }
+    }
+    return authState.idToken;
+  }
+  async function fsFetch(url, opts){
+    opts = opts || {};
+    var token = await authToken();
+    opts.headers = Object.assign({}, opts.headers, {'Authorization':'Bearer '+token});
+    var res = await fetch(url, opts);
+    if(res.status===401){
+      // token rejected: force one refresh, retry once
+      try{ authState.expiresAt = 0; var t2 = await authToken(); opts.headers['Authorization'] = 'Bearer '+t2; res = await fetch(url, opts); }
+      catch(e){ if(e.code==='NO_AUTH') throw e; }
+    }
+    return res;
+  }
+
   async function fsGetCollection(collection){
-    var res = await fetch(FIRESTORE_BASE+'/'+collection+'?pageSize=1000');
+    var res = await fsFetch(FIRESTORE_BASE+'/'+collection+'?pageSize=1000');
     if(!res.ok) throw new Error('GET '+collection+' -> HTTP '+res.status+': '+(await res.text()));
     var json = await res.json();
     return (json.documents||[]).map(fsFromDoc);
   }
   async function fsSetDoc(collection, id, data){
-    var res = await fetch(FIRESTORE_BASE+'/'+collection+'/'+encodeURIComponent(id), {
+    var res = await fsFetch(FIRESTORE_BASE+'/'+collection+'/'+encodeURIComponent(id), {
       method:'PATCH',
       headers:{'Content-Type':'application/json'},
       body: JSON.stringify({fields: fsToFields(data)})
@@ -316,7 +385,7 @@ input[type=text]::placeholder{ color:var(--text-dim); }
   }
   async function fsUpdateDoc(collection, id, data){
     var mask = Object.keys(data).map(function(k){ return 'updateMask.fieldPaths='+encodeURIComponent(k); }).join('&');
-    var res = await fetch(FIRESTORE_BASE+'/'+collection+'/'+encodeURIComponent(id)+'?'+mask, {
+    var res = await fsFetch(FIRESTORE_BASE+'/'+collection+'/'+encodeURIComponent(id)+'?'+mask, {
       method:'PATCH',
       headers:{'Content-Type':'application/json'},
       body: JSON.stringify({fields: fsToFields(data)})
@@ -324,9 +393,43 @@ input[type=text]::placeholder{ color:var(--text-dim); }
     if(!res.ok) throw new Error('UPDATE '+collection+'/'+id+' -> HTTP '+res.status+': '+(await res.text()));
   }
   async function fsDeleteDoc(collection, id){
-    var res = await fetch(FIRESTORE_BASE+'/'+collection+'/'+encodeURIComponent(id), {method:'DELETE'});
+    var res = await fsFetch(FIRESTORE_BASE+'/'+collection+'/'+encodeURIComponent(id), {method:'DELETE'});
     if(!res.ok) throw new Error('DELETE '+collection+'/'+id+' -> HTTP '+res.status+': '+(await res.text()));
   }
+
+  // ---- login overlay (lives outside #content so render() never wipes it) ----
+  function showLogin(){
+    var el = document.getElementById('login-overlay');
+    if(el){ el.style.display='flex'; return; }
+    el = document.createElement('div');
+    el.id = 'login-overlay';
+    el.style.cssText = 'position:fixed;inset:0;z-index:1000;background:var(--bg);display:flex;align-items:center;justify-content:center;padding:24px;';
+    el.innerHTML = '<form id="login-form" class="card" style="width:100%;max-width:340px;">'
+      + '<h2 style="margin:0;">Connexion</h2>'
+      + '<p style="margin:0;font-size:12.5px;color:var(--text-dim);">Une seule fois par appareil.</p>'
+      + '<input id="login-email" type="email" name="username" autocomplete="username" placeholder="E-mail" required style="padding:10px;border-radius:10px;border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:16px;">'
+      + '<input id="login-pass" type="password" name="password" autocomplete="current-password" placeholder="Mot de passe" required style="padding:10px;border-radius:10px;border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:16px;">'
+      + '<div id="login-err" style="color:var(--danger);font-size:12.5px;min-height:16px;"></div>'
+      + '<button type="submit" class="btn-primary btn-block">Se connecter</button>'
+      + '</form>';
+    document.body.appendChild(el);
+    document.getElementById('login-form').addEventListener('submit', async function(ev){
+      ev.preventDefault();
+      var err = document.getElementById('login-err');
+      err.textContent = '';
+      try{
+        await authSignIn(document.getElementById('login-email').value.trim(), document.getElementById('login-pass').value);
+        document.getElementById('login-pass').value = '';
+        el.style.display = 'none';
+        logEvent('connexion réussie');
+        startSync().then(function(msg){ toast(msg || 'Connecté'); });
+      }catch(e){
+        err.textContent = (e.message==='INVALID_LOGIN_CREDENTIALS' || e.message==='INVALID_PASSWORD' || e.message==='EMAIL_NOT_FOUND') ? 'E-mail ou mot de passe incorrect' : ('Échec : '+e.message);
+        logEvent('connexion ÉCHEC: '+e.message);
+      }
+    });
+  }
+  function hideLogin(){ var el = document.getElementById('login-overlay'); if(el) el.style.display='none'; }
 
   var CATEGORIES = [
     {key:'circuit', label:'Circuit', color:'var(--c-circuit)'},
@@ -917,7 +1020,7 @@ input[type=text]::placeholder{ color:var(--text-dim); }
   }
 
   // ---- render: views ----
-  var APP_VERSION = 'v41';
+  var APP_VERSION = 'v42';
   function topbarHtml(){
     var streak = computeStreak();
     return '<h1>Suivi <small style="font-size:9px;color:var(--text-dim);font-weight:500;vertical-align:middle;">'+APP_VERSION+'</small></h1>'
@@ -1244,6 +1347,7 @@ input[type=text]::placeholder{ color:var(--text-dim); }
           ? '<textarea id="backup-out" readonly rows="6" style="width:100%;margin-top:8px;font-size:11px;">'+escapeHtml(buildBackupText())+'</textarea>'
             + '<button class="btn-primary btn-block" data-action="copy-backup">Copier</button>'
           : '')
+        + '<button class="btn-secondary btn-block" data-action="logout" style="margin-top:8px;">Se déconnecter</button>'
         + '<p style="font-size:12px;color:var(--text-dim);margin:10px 0 4px;">Restaurer : colle ici un texte de sauvegarde.</p>'
         + '<textarea id="backup-in" rows="3" placeholder="Coller la sauvegarde ici" style="width:100%;font-size:11px;">'+escapeHtml(backupImportText)+'</textarea>'
         + '<button class="btn-primary btn-block" data-action="import-backup">Importer le texte collé</button>'
@@ -1523,6 +1627,7 @@ input[type=text]::placeholder{ color:var(--text-dim); }
       }
       case 'pick-history-cat': historyCategory = btn.dataset.cat; render(); break;
       case 'export-excel': exportExcel(); break;
+      case 'logout': authState = null; saveAuth(); sessions=[]; alcohol=[]; gainage=[]; injuries=[]; saveLocalFallback(); render(); showLogin(); break;
       case 'toggle-backup': backupOpen = !backupOpen; render(); break;
       case 'copy-backup': copyBackupText(); break;
       case 'import-backup': importBackupText(); break;
@@ -1591,9 +1696,10 @@ input[type=text]::placeholder{ color:var(--text-dim); }
   // ---- boot ----
   loadPendingOps();
   loadLocalFallback();
+  loadAuth();
   render();
 
-  var TERMINAL_CODES = ['not_granted','capability_disabled','capability_removed','revoked'];
+  var TERMINAL_CODES = ['not_granted','capability_disabled','capability_removed','revoked','NO_AUTH'];
   var MAX_RETRIES = 4;
 
   function sleep(ms){ return new Promise(function(res){ setTimeout(res, ms); }); }
@@ -1653,9 +1759,11 @@ input[type=text]::placeholder{ color:var(--text-dim); }
 
   async function startSync(){
     logEvent('startSync démarré (REST)');
+    if(!authState){ showLogin(); return 'Connexion requise'; }
     await flushPendingOps();
     await loadAll();
     logEvent('startSync: loadAll terminé, sessions en mémoire='+sessions.length+', dbUnavailable='+dbUnavailable);
+    if(!authState){ return 'Connexion requise'; }
     if(dbUnavailable){
       return 'Hors ligne';
     }
