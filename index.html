@@ -841,24 +841,83 @@ input[type=text]::placeholder{ color:var(--text-dim); }
         if(r[2] && r[2]!=='(en cours)') data.endDate = r[2];
         ops.push({type:'add', collection:'injuries', localId:'imp-inj-'+r[1]+'-'+String(r[0]).toLowerCase().replace(/[^a-z0-9]+/g,'-'), data:data});
       });
-      if(!ops.length){ toast('Aucune donnée trouvée dans ce fichier'); return; }
-      var done = 0;
-      for(var i=0;i<ops.length;i++){
-        await performOp(ops[i]);
-        done++;
-        if(done%10===0) toast('Import… '+done+'/'+ops.length);
-      }
-      logEvent('import: '+done+' éléments envoyés');
-      await loadAll();
-      toast('Import terminé : '+done+' éléments');
+      await runImportOps(ops);
     }catch(e){
       logEvent('import ÉCHEC: '+e.message);
       toast('Import échoué : '+e.message);
     }
   }
 
+  // Sends import ops one by one. A failed op is queued (never lost) and the
+  // import goes on, so one network hiccup cannot abort the whole restore.
+  async function runImportOps(ops){
+    if(!ops.length){ toast('Aucune donnée trouvée'); return; }
+    var done = 0, failed = 0;
+    for(var i=0;i<ops.length;i++){
+      try{ await performOp(ops[i]); done++; }
+      catch(e){ queueOp(ops[i]); failed++; logEvent('import: échec '+ops[i].collection+' '+(ops[i].docId||ops[i].localId)+' : '+e.message); }
+      if((i+1)%10===0) toast('Import… '+(i+1)+'/'+ops.length);
+    }
+    logEvent('import: '+done+' envoyés, '+failed+' en attente');
+    await loadAll();
+    toast(failed ? ('Import : '+done+' envoyés, '+failed+' en attente (réseau)') : ('Import terminé : '+done+' éléments'));
+  }
+
+  // ---- text backup / restore (works even where file download is blocked) ----
+  var backupOpen = false;
+  var backupImportText = '';
+  function buildBackupText(){
+    return JSON.stringify({
+      app:'suivi-forme', v:1, exportedAt:new Date().toISOString(),
+      sessions:sessions, alcohol:alcohol, gainage:gainage, injuries:injuries
+    });
+  }
+  function copyBackupText(){
+    var ta = document.getElementById('backup-out');
+    if(!ta){ return; }
+    var txt = ta.value;
+    var fallback = function(){
+      try{ ta.focus(); ta.select(); ta.setSelectionRange(0, txt.length); var ok = document.execCommand('copy'); toast(ok ? 'Copié' : 'Sélectionné : fais Copier à la main'); }
+      catch(e){ toast('Sélectionné : fais Copier à la main'); }
+    };
+    if(navigator.clipboard && navigator.clipboard.writeText){
+      navigator.clipboard.writeText(txt).then(function(){ toast('Copié'); }, fallback);
+    } else { fallback(); }
+  }
+  async function importBackupText(){
+    var raw = (backupImportText||'').trim();
+    if(!raw){ toast('Colle d\'abord le texte'); return; }
+    var obj;
+    try{ obj = JSON.parse(raw); }catch(e){ toast('Texte invalide (copie incomplète ?)'); return; }
+    if(!obj || obj.app!=='suivi-forme'){ toast('Ce texte n\'est pas une sauvegarde Suivi'); return; }
+    var now = new Date().toISOString();
+    var ops = [], counters = {};
+    (obj.sessions||[]).forEach(function(s){
+      if(!s || !s.date || !s.category) return;
+      var k = s.date+'|'+s.category; counters[k] = (counters[k]||0)+1;
+      ops.push({type:'add', collection:'sessions', localId:'imp-'+s.date+'-'+s.category+'-'+counters[k], data:{date:s.date, category:s.category, note:s.note||'', createdAt:s.createdAt||now}});
+    });
+    (obj.alcohol||[]).forEach(function(a){
+      if(!a || !a.date || !a.level) return;
+      ops.push({type:'set', collection:'alcohol', docId:a.date, data:{date:a.date, level:a.level, createdAt:a.createdAt||now}});
+    });
+    (obj.gainage||[]).forEach(function(g){
+      if(!g || !g.date) return;
+      ops.push({type:'set', collection:'gainage', docId:g.date, data:{date:g.date, createdAt:g.createdAt||now}});
+    });
+    (obj.injuries||[]).forEach(function(i){
+      if(!i || !i.zone || !i.startDate) return;
+      var data = {zone:i.zone, startDate:i.startDate, note:i.note||'', createdAt:i.createdAt||now};
+      if(i.endDate) data.endDate = i.endDate;
+      ops.push({type:'add', collection:'injuries', localId:'imp-inj-'+i.startDate+'-'+String(i.zone).toLowerCase().replace(/[^a-z0-9]+/g,'-'), data:data});
+    });
+    backupImportText = '';
+    await runImportOps(ops);
+    render();
+  }
+
   // ---- render: views ----
-  var APP_VERSION = 'v40';
+  var APP_VERSION = 'v41';
   function topbarHtml(){
     var streak = computeStreak();
     return '<h1>Suivi <small style="font-size:9px;color:var(--text-dim);font-weight:500;vertical-align:middle;">'+APP_VERSION+'</small></h1>'
@@ -1178,6 +1237,17 @@ input[type=text]::placeholder{ color:var(--text-dim); }
       + '<button class="btn-primary btn-block" data-action="export-excel">Exporter toutes les données (.xlsx)</button>'
       + '<button class="btn-secondary btn-block" data-action="import-excel">Importer un export (.xlsx)</button>'
       + '<input type="file" id="import-file" accept=".xlsx" hidden>'
+      + '<div class="card">'
+        + '<h2>Sauvegarde par texte</h2>'
+        + '<button class="btn-secondary btn-block" data-action="toggle-backup">'+(backupOpen?'Masquer':'Afficher mes données (texte à copier)')+'</button>'
+        + (backupOpen
+          ? '<textarea id="backup-out" readonly rows="6" style="width:100%;margin-top:8px;font-size:11px;">'+escapeHtml(buildBackupText())+'</textarea>'
+            + '<button class="btn-primary btn-block" data-action="copy-backup">Copier</button>'
+          : '')
+        + '<p style="font-size:12px;color:var(--text-dim);margin:10px 0 4px;">Restaurer : colle ici un texte de sauvegarde.</p>'
+        + '<textarea id="backup-in" rows="3" placeholder="Coller la sauvegarde ici" style="width:100%;font-size:11px;">'+escapeHtml(backupImportText)+'</textarea>'
+        + '<button class="btn-primary btn-block" data-action="import-backup">Importer le texte collé</button>'
+      + '</div>'
     + '</section>';
   }
 
@@ -1453,6 +1523,9 @@ input[type=text]::placeholder{ color:var(--text-dim); }
       }
       case 'pick-history-cat': historyCategory = btn.dataset.cat; render(); break;
       case 'export-excel': exportExcel(); break;
+      case 'toggle-backup': backupOpen = !backupOpen; render(); break;
+      case 'copy-backup': copyBackupText(); break;
+      case 'import-backup': importBackupText(); break;
       case 'import-excel': { var f=document.getElementById('import-file'); if(f) f.click(); break; }
       case 'retry-sync':
         btn.classList.add('spinning');
@@ -1497,6 +1570,7 @@ input[type=text]::placeholder{ color:var(--text-dim); }
   });
 
   document.getElementById('content').addEventListener('input', function(e){
+    if(e.target.id==='backup-in'){ backupImportText = e.target.value; }
     if(e.target.id==='session-note'){ draftNote = e.target.value; }
     if(e.target.id==='edit-note'){ editNote = e.target.value; }
     if(e.target.id==='injury-zone'){ injuryZone = e.target.value; }
