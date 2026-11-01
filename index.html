@@ -105,7 +105,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible{ outline:2px s
 .dot{ width:10px; height:10px; border-radius:50%; flex:none; }
 .session-info{ flex:1; display:flex; flex-direction:column; gap:1px; min-width:0; }
 .session-cat{ font-weight:600; font-size:14px; }
-.session-note{ font-size:12.5px; color:var(--text-dim); overflow-wrap:anywhere; }
+.session-note{ font-size:12.5px; color:var(--text-dim); overflow-wrap:anywhere; white-space:pre-wrap; }
 .icon-btn{ background:none; border:none; color:var(--text-dim); font-size:13px; padding:5px; line-height:1; }
 .empty{ color:var(--text-dim); font-size:13px; margin:0; }
 
@@ -212,7 +212,7 @@ input[type=text]::placeholder{ color:var(--text-dim); }
 .edit-row{ list-style:none; }
 .history-item:last-child{ border-bottom:none; }
 .history-date{ font-family:var(--font-mono); font-weight:600; font-size:12.5px; text-transform:capitalize; }
-.history-note{ font-size:13px; margin-top:2px; }
+.history-note{ font-size:13px; margin-top:2px; white-space:pre-wrap; overflow-wrap:anywhere; }
 .history-note.dim{ color:var(--text-dim); font-style:italic; }
 
 .injury-list{ list-style:none; margin:0; padding:0; display:flex; flex-direction:column; }
@@ -966,6 +966,63 @@ input[type=text]::placeholder{ color:var(--text-dim); }
     toast(failed ? ('Import : '+done+' envoyés, '+failed+' en attente (réseau)') : ('Import terminé : '+done+' éléments'));
   }
 
+  // ---- summary for Claude (copy/paste into a chat) ----
+  function buildClaudeSummary(){
+    var from = statsFrom, to = statsTo;
+    var inR = function(d){ return d>=from && d<=to; };
+    var ss = sessions.filter(function(x){ return inR(x.date); }).sort(function(a,b){ return a.date.localeCompare(b.date) || (a.createdAt||'').localeCompare(b.createdAt||''); });
+    var al = alcohol.filter(function(x){ return inR(x.date); }).sort(function(a,b){ return a.date.localeCompare(b.date); });
+    var ga = gainage.filter(function(x){ return inR(x.date); }).sort(function(a,b){ return a.date.localeCompare(b.date); });
+    var inj = injuries.filter(function(i){ return i.startDate<=to && (!i.endDate || i.endDate>=from); }).sort(function(a,b){ return a.startDate.localeCompare(b.startDate); });
+    var nDays = Math.round((parseISO(to)-parseISO(from))/86400000)+1;
+    var out = [];
+    out.push('Suivi Forme — données du '+from+' au '+to+' ('+nDays+' jours), exporté le '+fmt(new Date())+'.');
+    out.push('');
+    out.push('RÉSUMÉ');
+    var byCat = {};
+    ss.forEach(function(x){ var l=(CAT_MAP[x.category]||{}).label||x.category; byCat[l]=(byCat[l]||0)+1; });
+    out.push('- Séances : '+ss.length+(ss.length ? ' ('+Object.keys(byCat).map(function(k){ return k+' '+byCat[k]; }).join(', ')+')' : ''));
+    var byLvl = {};
+    al.forEach(function(x){ var l=(ALC_MAP[x.level]||{}).label||x.level; byLvl[l]=(byLvl[l]||0)+1; });
+    out.push('- Jours avec alcool : '+al.length+' sur '+nDays+(al.length ? ' ('+Object.keys(byLvl).map(function(k){ return k+' '+byLvl[k]; }).join(', ')+')' : ''));
+    out.push('- Jours de gainage : '+ga.length+' sur '+nDays);
+    out.push('');
+    out.push('SÉANCES (date · catégorie · notes)');
+    if(!ss.length) out.push('(aucune)');
+    ss.forEach(function(x){
+      var l=(CAT_MAP[x.category]||{}).label||x.category;
+      out.push('- '+x.date+' · '+l+(x.note ? ' · '+String(x.note).replace(/\s*\n\s*/g,' / ') : ''));
+    });
+    out.push('');
+    out.push('ALCOOL');
+    out.push(al.length ? al.map(function(x){ return x.date+' '+((ALC_MAP[x.level]||{}).label||x.level); }).join(', ') : '(aucun)');
+    out.push('');
+    out.push('GAINAGE (jours faits)');
+    out.push(ga.length ? ga.map(function(x){ return x.date; }).join(', ') : '(aucun)');
+    out.push('');
+    out.push('BLESSURES (actives ou chevauchant la période)');
+    if(!inj.length) out.push('(aucune)');
+    inj.forEach(function(i){
+      out.push('- '+i.zone+' : du '+i.startDate+' au '+(i.endDate||'(en cours)')+(i.note ? ' · '+i.note : ''));
+    });
+    return out.join('\n');
+  }
+  function copyText(txt, okMsg){
+    var fallback = function(){
+      try{
+        var ta = document.createElement('textarea');
+        ta.value = txt; ta.setAttribute('readonly',''); ta.style.cssText='position:fixed;top:0;left:0;opacity:0;';
+        document.body.appendChild(ta); ta.focus(); ta.select(); ta.setSelectionRange(0, txt.length);
+        var ok = document.execCommand('copy');
+        document.body.removeChild(ta);
+        toast(ok ? okMsg : 'Copie impossible');
+      }catch(e){ toast('Copie impossible'); }
+    };
+    if(navigator.clipboard && navigator.clipboard.writeText){
+      navigator.clipboard.writeText(txt).then(function(){ toast(okMsg); }, fallback);
+    } else { fallback(); }
+  }
+
   // ---- text backup / restore (works even where file download is blocked) ----
   var backupOpen = false;
   var backupImportText = '';
@@ -1020,7 +1077,7 @@ input[type=text]::placeholder{ color:var(--text-dim); }
   }
 
   // ---- render: views ----
-  var APP_VERSION = 'v42';
+  var APP_VERSION = 'v43';
   function topbarHtml(){
     var streak = computeStreak();
     return '<h1>Suivi <small style="font-size:9px;color:var(--text-dim);font-weight:500;vertical-align:middle;">'+APP_VERSION+'</small></h1>'
@@ -1059,7 +1116,7 @@ input[type=text]::placeholder{ color:var(--text-dim); }
           }).join('')
       + '</div>'
       + '<div class="filter-row"><label>Date <input type="date" id="edit-date" value="'+editDate+'"></label></div>'
-      + '<textarea id="edit-note" placeholder="Note rapide (optionnel)" maxlength="200">'+escapeHtml(editNote)+'</textarea>'
+      + '<textarea id="edit-note" placeholder="Notes : exercices, charges, ressenti… (optionnel)" maxlength="2000" rows="5" style="min-height:120px;">'+escapeHtml(editNote)+'</textarea>'
       + '<div class="form-actions">'
         + '<button class="btn-secondary" data-action="cancel-edit-session">Annuler</button>'
         + '<button class="btn-primary" data-action="save-edit-session" data-id="'+s.id+'"'+((editCategory&&editDate)?'':' disabled')+'>Enregistrer</button>'
@@ -1074,7 +1131,7 @@ input[type=text]::placeholder{ color:var(--text-dim); }
             return '<button class="cat-chip'+(selectedCategory===c.key?' active':'')+'" style="--chip:'+c.color+'" data-action="pick-category" data-cat="'+c.key+'">'+c.label+'</button>';
           }).join('')
       + '</div>'
-      + '<textarea id="session-note" placeholder="Note rapide (optionnel)" maxlength="200">'+escapeHtml(draftNote)+'</textarea>'
+      + '<textarea id="session-note" placeholder="Notes : exercices, charges, ressenti… (optionnel)" maxlength="2000" rows="5" style="min-height:120px;">'+escapeHtml(draftNote)+'</textarea>'
       + '<div class="form-actions">'
         + '<button class="btn-secondary" data-action="cancel-add-session">Annuler</button>'
         + '<button class="btn-primary" data-action="save-session" data-date="'+ds+'"'+(selectedCategory?'':' disabled')+'>Enregistrer</button>'
@@ -1337,7 +1394,8 @@ input[type=text]::placeholder{ color:var(--text-dim); }
         + '<p class="stat-line">'+alcDays+' jour(s) sur '+days+' — '+deltaTag(alcDays, prevAlcohol.length)+'</p>'
         + '<ul class="bar-list">'+byLevel.map(function(l){ return barRow(l.label, l.count, Math.max(alcDays,1), l.color); }).join('')+'</ul>'
       + '</div>'
-      + '<button class="btn-primary btn-block" data-action="export-excel">Exporter toutes les données (.xlsx)</button>'
+      + '<button class="btn-primary btn-block" data-action="copy-claude">Copier le résumé pour Claude ('+statsFrom+' → '+statsTo+')</button>'
+      + '<button class="btn-secondary btn-block" data-action="export-excel">Exporter toutes les données (.xlsx)</button>'
       + '<button class="btn-secondary btn-block" data-action="import-excel">Importer un export (.xlsx)</button>'
       + '<input type="file" id="import-file" accept=".xlsx" hidden>'
       + '<div class="card">'
@@ -1628,6 +1686,7 @@ input[type=text]::placeholder{ color:var(--text-dim); }
       case 'pick-history-cat': historyCategory = btn.dataset.cat; render(); break;
       case 'export-excel': exportExcel(); break;
       case 'logout': authState = null; saveAuth(); sessions=[]; alcohol=[]; gainage=[]; injuries=[]; saveLocalFallback(); render(); showLogin(); break;
+      case 'copy-claude': copyText(buildClaudeSummary(), 'Résumé copié — colle-le dans Claude'); break;
       case 'toggle-backup': backupOpen = !backupOpen; render(); break;
       case 'copy-backup': copyBackupText(); break;
       case 'import-backup': importBackupText(); break;
